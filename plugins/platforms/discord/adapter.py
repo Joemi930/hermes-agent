@@ -39,6 +39,26 @@ _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
+def _rewrite_known_bang_command(text: str) -> str:
+    """Rewrite a known leading ``!cmd`` to the gateway ``/cmd`` form.
+
+    Discord text commands are a convenience layer over Hermes' existing slash-command
+    dispatcher, so aliases, authorization, busy policies, and handlers remain single-sourced.
+    Unknown ``!words`` are left untouched and continue through normal conversational routing.
+    """
+    if not text.startswith("!"):
+        return text
+    try:
+        from hermes_cli.commands import is_gateway_known_command
+        first_token = text[1:].split(maxsplit=1)[0]
+        cmd_name = first_token.split("@", 1)[0].lower()
+        if cmd_name and "/" not in cmd_name and is_gateway_known_command(cmd_name):
+            return "/" + text[1:]
+    except Exception:
+        logger.debug("Discord bang-command normalization failed", exc_info=True)
+    return text
+
+
 def _voice_mixer_module():
     """Sibling ``voice_mixer`` module: flat import (plugin dir on sys.path) else package-relative."""
     try:
@@ -5956,7 +5976,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
-            message.content = normalized_content
+        # Discord text-command compatibility: `!modèle`, `!modele`, and `!effort` are
+        # normalized to Hermes' existing slash-command path. This keeps all access-control,
+        # busy-session, model-switch, and reasoning behavior in one dispatcher.
+        normalized_content = _rewrite_known_bang_command(normalized_content)
+        message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:

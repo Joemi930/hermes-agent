@@ -561,31 +561,34 @@ class GatewayStatusCommandsMixin:
             return []
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
-        """Handle /usage -- token usage for the current session (live or cached agent) plus
-        account/credit blocks; ``/usage reset [--force]`` redeems a banked Codex reset credit."""
+        """Handle /usage.
+
+        Default gateway behavior shows the current session usage plus account-limit snapshots for
+        every authenticated provider visible to the routed profile. Provider APIs differ: Hermes
+        reports real remaining windows where an official usage endpoint exists, and explicitly says
+        when a provider does not expose an account quota through Hermes yet. ``reset`` keeps its
+        existing Codex behavior. ``<provider>`` filters the account section to one provider.
+        """
         source = event.source
         session_key = self._session_key_for_source(source)
         raw_args = event.get_command_args().strip()
         args = [a.lower() for a in raw_args.split()] if raw_args else []
         wants_reset = bool(args) and args[0] == "reset"
-        if args and not wants_reset:
+        wants_global = bool(args) and args[0] in {"global", "all-profiles"}
+        filter_provider = "" if not args or wants_reset or wants_global or args[0] == "all" else args[0]
+        if len(args) > 1 or (args and not wants_reset and args[0] != "all" and args[0].startswith("--")):
             return t("gateway.usage.unknown_subcommand", args=raw_args)
 
-        # Running agent first (mid-turn), then cached agent (between turns).
+        # Running agent first, then cached agent.
         agent = self._resident_agent_for(session_key)
-
-        # Provider/base_url/api_key for the account-usage fetch: live agent first, else persisted
-        # billing data on the SessionDB row so `/usage` still returns account info between turns.
         provider, base_url, api_key = (
             getattr(agent, k, None) if agent else None for k in ("provider", "base_url", "api_key")
         )
         if not provider and getattr(self, "_session_db", None) is not None:
             provider, base_url = await self._persisted_billing_route(source)
         if not provider:
-            # Fresh or evicted session with no persisted route (e.g. /usage right after login):
-            # fall back to the configured provider, as /status does, so account limits such as
-            # Codex subscription windows still render from on-disk credentials (#15167).
             provider = await _quiet(lambda: asyncio.to_thread(_configured_provider)) or None
+
         if wants_reset:
             if str(provider or "").strip().lower() != "openai-codex":
                 return t("gateway.usage.reset_wrong_provider")
@@ -595,39 +598,139 @@ class GatewayStatusCommandsMixin:
             )
             return result.message
 
-        # Account usage off the event loop so slow provider APIs don't block the gateway;
-        # failures are non-fatal (account_lines stays []).
-        account_snapshot = provider and await _quiet(
-            lambda: asyncio.to_thread(fetch_account_usage, provider, base_url=base_url, api_key=api_key)
-        )
-        account_lines = (
-            render_account_usage_lines(account_snapshot, markdown=True) if account_snapshot else []
-        )
+        from agent.account_usage import fetch_account_usage, render_account_usage_lines
+        from hermes_cli.model_switch import list_authenticated_providers
 
-        # Nous credits + monthly-grant gauge (shared with CLI/TUI). Gates on "a Nous account is
-        # logged in" — NOT the inference provider — so a Nous user inferring elsewhere still sees
-        # a balance. Fail-open: never break /usage.
+        # Optional global inventory: inspect every named profile with its own isolated credential scope,
+        # then deduplicate by provider. This lets e.g. Secretary expose DeepSeek/Meta while a developer
+        # profile may only carry Claude/Copilot credentials. Future providers are picked up automatically
+        # when their credentials enter a profile and Hermes has a usage fetcher/plugin for them.
+        if wants_global:
+            from hermes_cli.profiles import get_profile_dir, list_profiles
+            from gateway.run import _profile_runtime_scope
+
+            global_snapshots = {}
+            global_profiles = {}
+            try:
+                profile_names = [info.name for info in list_profiles(lazy_skill_count=True)]
+            except Exception:
+                profile_names = []
+            for profile_name in profile_names:
+                profile_home = get_profile_dir(profile_name)
+                try:
+                    with _profile_runtime_scope(profile_home):
+                        rows = await asyncio.to_thread(
+                            list_authenticated_providers,
+                            max_models=1, non_blocking_catalogs=True,
+                            probe_custom_providers=False, for_picker=False,
+                        )
+                        slugs = []
+                        for row in rows:
+                            slug = str(row.get("slug") or "").strip().lower()
+                            if slug and slug != "nous" and slug not in slugs:
+                                slugs.append(slug)
+                        for slug in slugs:
+                            snap = await asyncio.to_thread(fetch_account_usage, slug)
+                            global_profiles.setdefault(slug, []).append(profile_name)
+                            if snap is not None and slug not in global_snapshots:
+                                global_snapshots[slug] = snap
+                except Exception as exc:
+                    logger.debug("global usage scan failed for profile %s: %s", profile_name, exc)
+
+            if not global_profiles:
+                return "📊 Aucun fournisseur avec identifiants n’a été trouvé sur les profils Hermes."
+            lines = ["🌐 **Limites de comptes — tous les profils**", ""]
+            for slug in sorted(global_profiles):
+                snap = global_snapshots.get(slug)
+                configured = ", ".join(global_profiles[slug])
+                if snap:
+                    block = render_account_usage_lines(snap, markdown=True)
+                    lines.extend(block)
+                    lines.append(f"Profils configurés: `{configured}`")
+                else:
+                    lines.extend([
+                        "📈 **Account limits**",
+                        f"Provider: {slug}",
+                        "Account quota: unavailable via Hermes for this provider (credential configured; no standardized usage endpoint).",
+                        f"Profils configurés: `{configured}`",
+                    ])
+                lines.append("")
+            return "\n".join(lines).rstrip()
+
+        # Discover only providers backed by this routed profile's credentials. No model is inferred
+        # from the static catalog, and future providers become visible automatically once Hermes can
+        # resolve their credentials.
+        try:
+            inventory = await asyncio.to_thread(
+                list_authenticated_providers,
+                max_models=1, current_provider=str(provider or ""), current_base_url=str(base_url or ""),
+                current_model=str(getattr(agent, "model", "") or ""), non_blocking_catalogs=True,
+                probe_custom_providers=False, for_picker=False,
+            )
+        except Exception:
+            inventory = []
+
+        provider_slugs = []
+        for row in inventory:
+            slug = str(row.get("slug") or "").strip().lower()
+            if slug and slug != "nous" and slug not in provider_slugs:
+                provider_slugs.append(slug)
+        current_slug = str(provider or "").strip().lower()
+        if current_slug and current_slug not in provider_slugs:
+            provider_slugs.insert(0, current_slug)
+        if filter_provider:
+            provider_slugs = [p for p in provider_slugs if p == filter_provider]
+
+        async def _fetch(slug: str):
+            # Current session route carries an explicit base URL/api key when available; other
+            # providers resolve their own profile credential through the normal provider pool.
+            kwargs = {"base_url": base_url if slug == current_slug else None,
+                      "api_key": api_key if slug == current_slug else None}
+            snap = await asyncio.to_thread(fetch_account_usage, slug, **kwargs)
+            return slug, snap
+
+        snapshots = {}
+        if provider_slugs:
+            results = await asyncio.gather(*(_fetch(slug) for slug in provider_slugs), return_exceptions=True)
+            for result in results:
+                if isinstance(result, tuple):
+                    slug, snap = result
+                    snapshots[slug] = snap
+
+        # Keep the session-token part of /usage intact. Account limits below are intentionally
+        # provider-wide and independent from this individual session.
         from agent.account_usage import nous_credits_lines
         credits_lines = await _quiet(lambda: asyncio.to_thread(nous_credits_lines, markdown=True), [])
 
+        account_blocks = []
+        for slug in provider_slugs:
+            snapshot = snapshots.get(slug)
+            if snapshot:
+                account_blocks.append(render_account_usage_lines(snapshot, markdown=True))
+            else:
+                # Provider has a credential but Hermes currently has no standardized account-limit
+                # endpoint for it. Be explicit rather than pretending a percentage is known.
+                account_blocks.append([
+                    f"📈 **Account limits**",
+                    f"Provider: {slug}",
+                    "Account quota: unavailable via Hermes for this provider (credential is configured; no standardized usage endpoint).",
+                ])
+
         def _with_account_blocks(lines: list[str]) -> str:
-            # Each block is preceded by a blank divider only when something precedes it.
-            for block in (account_lines, credits_lines):
+            for block in account_blocks + ([credits_lines] if credits_lines else []):
                 if block:
                     if lines:
                         lines.append("")
                     lines.extend(block)
             return "\n".join(lines)
+
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = _usage_agent_stats_lines(agent)
-            # Per-category breakdown (chars/4 estimate, same engine as the desktop popover): prompt
-            # / tools / skills / memory off the live agent, conversation from the transcript.
             breakdown_lines = await asyncio.to_thread(self._context_breakdown_lines, agent, source)
             if breakdown_lines:
                 lines += [""] + breakdown_lines
             return _with_account_blocks(lines)
 
-        # No agent at all -- rough count from session history
         session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -641,7 +744,7 @@ class GatewayStatusCommandsMixin:
                 t("gateway.usage.label_estimated_context", count=_fmt(approx)),
                 t("gateway.usage.detailed_after_first"),
             ])
-        if account_lines or credits_lines:
+        if account_blocks or credits_lines:
             return _with_account_blocks([])
         return t("gateway.usage.no_data")
 

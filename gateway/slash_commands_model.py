@@ -496,6 +496,64 @@ class GatewayModelCommandsMixin:
             event=event, command="model", title=warning.title, message=message, handler=_on_cost_confirm,
         )
 
+    async def _handle_list_model_command(self, event: MessageEvent) -> Optional[str]:
+        """List models that this routed profile can actually select via authenticated providers.
+
+        This is deliberately a gateway-side read path: no LLM call, works while the agent is busy,
+        and stays scoped to the profile selected by the Discord channel route. ``--refresh`` is
+        available for an explicit live catalog refresh; otherwise cached catalogs are used so a
+        degraded provider cannot block a simple inventory query.
+        """
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        raw = event.get_command_args().strip()
+        parts = raw.split() if raw else []
+        refresh = any(part.lower() in {"--refresh", "refresh"} for part in parts)
+        provider_filter = next((part.lower() for part in parts if not part.startswith("-" ) and part.lower() != "refresh"), "")
+
+        try:
+            providers = await asyncio.to_thread(
+                list_authenticated_providers,
+                max_models=None,
+                refresh=refresh,
+                non_blocking_catalogs=not refresh,
+                probe_custom_providers=False,
+                for_picker=True,
+            )
+        except Exception as exc:
+            logger.warning("list-model inventory failed: %s", exc)
+            return f"❌ Impossible de récupérer la liste des modèles : {exc}"
+
+        if provider_filter:
+            providers = [
+                row for row in providers
+                if provider_filter in {str(row.get("slug", "")).lower(), str(row.get("name", "")).lower()}
+            ]
+
+        visible = []
+        for row in providers:
+            models = row.get("models") or []
+            if models:
+                visible.append((row, models))
+
+        if not visible:
+            scope = f" pour `{provider_filter}`" if provider_filter else ""
+            return (
+                f"🧠 Aucun modèle directement sélectionnable trouvé{scope} sur ce profil.\n"
+                "Utilise `!list-model --refresh` après avoir ajouté une nouvelle clé/provisioning."
+            )
+
+        lines = ["🧠 **Modèles disponibles sur ce profil**", ""]
+        for row, models in visible:
+            slug = row.get("slug") or "?"
+            name = row.get("name") or slug
+            lines.append(f"**{name}** · `{slug}` · {len(models)} modèles")
+            lines.extend(f"• `{model}`" for model in models)
+            lines.append("")
+        lines.append("💡 `!list-model <provider>` filtre un fournisseur · `!list-model --refresh` actualise le catalogue.")
+        return "\n".join(lines)
+
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model. Taken under the switch lock BEFORE the first await so
         concurrent commands commit in issue order (see ``_model_switch_lock``)."""
